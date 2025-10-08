@@ -92,7 +92,7 @@ class Poisson2D:
             i, j = divmod(idx, N+1)
             A[idx, :] = 0
             A[idx, idx] = 1
-            b[idx] = float(self.ue.sub({x: xij[i, j], y: yij[i, j]}))
+            b[idx] = float(self.ue.subs({x: xij[i, j], y: yij[i, j]}))
 
         return A.tocsr(), b
     
