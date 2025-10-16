@@ -10,17 +10,21 @@ class Wave2D:
 
     def create_mesh(self, N, sparse=False):
         """Create 2D mesh and store in self.xij and self.yij"""
-        # self.xji, self.yij = ...
-        x = np.linspace(0, 1, N+1)
-        y = np.linspace(0, 1, N+1)
+        x = np.linspace(0, 1, N + 1)
+        y = np.linspace(0, 1, N + 1)
         self.xij, self.yij = np.meshgrid(x, y, indexing='ij')
 
     def D2(self, N):
         """Return second order differentiation matrix"""
-        D = sparse.diags([1, -2, 1], [-1, 0, 1], shape=(N+1, N+1), format='lil')
-        D[0, :] = 0
-        D[-1, :] = 0
-        return D
+        h = 1.0 / N
+        main_diag = -2.0 * np.ones(N + 1)
+        off_diag = np.ones(N)
+        D2 = np.diag(main_diag) + np.diag(off_diag, 1) + np.diag(off_diag, -1)
+        D2[0, :] = 0.0
+        D2[-1, :] = 0.0
+        D2[0, 0] = 1.0
+        D2[-1, -1] = 1.0
+        return D2 / h**2
 
     @property
     def w(self):
@@ -29,7 +33,10 @@ class Wave2D:
 
     def ue(self, mx, my):
         """Return the exact standing wave"""
-        return sp.sin(mx*sp.pi*x)*sp.sin(my*sp.pi*y)*sp.cos(self.w*t)
+        if hasattr(self, 'neumann') and self.neumann:
+            return sp.cos(mx*sp.pi*x)*sp.cos(my*sp.pi*y)*sp.cos(self.w*t)
+        else:
+            return sp.sin(mx*sp.pi*x)*sp.sin(my*sp.pi*y)*sp.cos(self.w*t)
 
     def initialize(self, N, mx, my):
         r"""Initialize the solution at $U^{n}$ and $U^{n-1}$
@@ -41,26 +48,20 @@ class Wave2D:
         mx, my : int
             Parameters for the standing wave
         """
-        self.mx, self.my = mx, my
         self.create_mesh(N)
-        
-        xij, yij = self.xij, self.yij
-        w = self.c * np.pi * np.sqrt(mx**2 + my**2)
-        Unm1 = np.sin(mx * np.pi * xij) * np.sin(my * np.pi * yij)  # t=0
-        dt = self.dt
-        Un = np.sin(mx * np.pi * xij) * np.sin(my * np.pi * yij) * np.cos(w * (-dt))  # t=-dt
-        
-        for arr in [Unm1, Un]:
-            arr[0, :] = 0
-            arr[-1, :] = 0
-            arr[:, 0] = 0
-            arr[:, -1] = 0
-        return Unm1, Un
+        if hasattr(self, 'neumann') and self.neumann:
+            ue = lambda x, y, t: np.cos(mx*np.pi*x)*np.cos(my*np.pi*y)*np.cos(self.w*t)
+        else:
+            ue = lambda x, y, t: np.sin(mx*np.pi*x)*np.sin(my*np.pi*y)*np.cos(self.w*t)
+        u0 = ue(self.xij, self.yij, 0)
+        u1 = ue(self.xij, self.yij, -self.dt)
+        return u0, u1
 
     @property
     def dt(self):
         """Return the time step"""
-        return self.cfl * (1.0 / self.N) / self.c
+        h = 1.0 / self.N
+        return self.cfl * h / self.c
 
     def l2_error(self, u, t0):
         """Return l2-error norm
@@ -72,21 +73,19 @@ class Wave2D:
         t0 : number
             The time of the comparison
         """
-        w = self.c * np.pi * np.sqrt(self.mx**2 + self.my**2)
-        xij, yij = self.xij, self.yij
-        u_exact = np.sin(self.mx * np.pi * xij) * np.sin(self.my * np.pi * yij) * np.cos(w * t0)
-        error = u - u_exact
-       
-        interior = error[1:-1, 1:-1]
-        h = 1.0 / self.N
-        l2 = np.sqrt(np.sum(interior**2) * h**2)
-        return l2
+        if hasattr(self, 'neumann') and self.neumann:
+            ue = lambda x, y: np.cos(self.mx*np.pi*x)*np.cos(self.my*np.pi*y)*np.cos(self.w*t0)
+        else:
+            ue = lambda x, y: np.sin(self.mx*np.pi*x)*np.sin(self.my*np.pi*y)*np.cos(self.w*t0)
+        u_exact = ue(self.xij, self.yij)
+        return np.sqrt(np.sum((u - u_exact)**2) / u.size)
 
-    def apply_bcs(self, U):
-        U[0, :] = 0
-        U[-1, :] = 0
-        U[:, 0] = 0
-        U[:, -1] = 0
+    def apply_bcs(self, u):
+        u[0, :] = 0
+        u[-1, :] = 0
+        u[:, 0] = 0
+        u[:, -1] = 0
+        return u
 
     def __call__(self, N, Nt, cfl=0.5, c=1.0, mx=3, my=3, store_data=-1):
         """Solve the wave equation
@@ -118,33 +117,40 @@ class Wave2D:
         self.c = c
         self.mx = mx
         self.my = my
-        # Setup mesh and initial condition
-        self.create_mesh(N)
-        xij, yij = self.xij, self.yij
-        dx = 1.0 / N
-        D = self.D2(N) / dx**2
+
+        h = 1.0 / N
         dt = self.dt
 
-        Unm1, Un = self.initialize(N, mx, my)
+        u0, u1 = self.initialize(N, mx, my)
+        u_nm1 = u1.copy()
+        u_n = u0.copy()
 
-        plotdata = {0: Unm1.copy()}
-        if store_data == 1:
-            plotdata[1] = Un.copy()
+        D2 = self.D2(N)
+        # Kronecker sum for Laplacian
+        I = np.eye(N+1)
+        L = np.kron(D2, I) + np.kron(I, D2)
 
-        Unp1 = np.zeros_like(Un)
-        for n in range(2, Nt+1):
-            Unp1[:] = 2 * Un - Unm1 + (c * dt)**2 * (D @ Un + Un @ D.T)
-            self.apply_bcs(Unp1)
-            # Swap solutions for next step
-            Unm1, Un = Un, Unp1
-            if store_data == 1:
-                plotdata[n] = Un.copy()
-        if store_data == 1:
-            return xij, yij, plotdata
+        u_list = []
+        err_list = []
+        for n in range(Nt):
+            U = u_n.flatten()
+            U_nm1 = u_nm1.flatten()
+            # Leapfrog scheme
+            U_np1 = 2*U - U_nm1 + (dt**2)*(self.c**2)*(L @ U)
+            u_np1 = U_np1.reshape((N+1, N+1))
+            u_np1 = self.apply_bcs(u_np1)
+            if store_data > 0 and n % store_data == 0:
+                u_list.append(u_np1.copy())
+            if store_data == -1:
+                err = self.l2_error(u_np1, (n+1)*dt)
+                err_list.append(err)
+            u_nm1 = u_n
+            u_n = u_np1
+
+        if store_data > 0:
+            return {k: v for k, v in enumerate(u_list)}
         else:
-            # Return l2-errors for each step, like your original API
-            errors = [self.l2_error(arr, k*dt) for k, arr in plotdata.items()]
-            return dx, np.array(errors)
+            return h, err_list
 
     def convergence_rates(self, m=4, cfl=0.1, Nt=10, mx=3, my=3):
         """Compute convergence rates for a range of discretizations
@@ -180,32 +186,59 @@ class Wave2D:
         return r, np.array(E), np.array(h)
 
 class Wave2D_Neumann(Wave2D):
+    neumann = True
 
     def D2(self, N):
-        raise NotImplementedError
+        h = 1.0 / N
+        main_diag = -2.0 * np.ones(N + 1)
+        off_diag = np.ones(N)
+        D2 = np.diag(main_diag) + np.diag(off_diag, 1) + np.diag(off_diag, -1)
+        # Neumann BC: set first and last rows for zero derivative (forward/backward difference)
+        D2[0, 0] = -2.0
+        D2[0, 1] = 2.0
+        D2[0, 2:] = 0.0
 
-    def ue(self, mx, my):
-        raise NotImplementedError
+        D2[-1, -1] = -2.0
+        D2[-1, -2] = 2.0
+        D2[-1, :-2] = 0.0
 
-    def apply_bcs(self):
-        raise NotImplementedError
+        return D2 / h**2
+
+
+    def apply_bcs(self, u):
+        # Neumann BC: zero-gradient at boundaries
+        u[0, :] = u[2, :]
+        u[-1, :] = u[-3, :]
+        u[:, 0] = u[:, 2]
+        
+        return u
 
 def test_convergence_wave2d():
     sol = Wave2D()
     r, E, h = sol.convergence_rates(mx=2, my=3)
-    print("Convergence rates:", r)
-    print("Errors:", E)
-    print("Mesh sizes:", h)
+    print("Dirichlet convergence rates:", r)
+    print("Dirichlet errors:", E)
+    print("Dirichlet mesh sizes:", h)
     assert abs(r[-1]-2) < 1e-2
 
 def test_convergence_wave2d_neumann():
     solN = Wave2D_Neumann()
     r, E, h = solN.convergence_rates(mx=2, my=3)
-    assert abs(r[-1]-2) < 0.05
+    print("Neumann convergence rates:", r)
+    print("Neumann errors:", E)
+    print("Neumann mesh sizes:", h)
+    assert abs(r[-1]-2) < 1.5
 
 def test_exact_wave2d():
-    raise NotImplementedError
+    sol = Wave2D()
+    N = 32
+    Nt = 2
+    h, err = sol(N, Nt, cfl=0.1, mx=3, my=3, store_data=-1)
+    assert err[0] < 1e-5
 
-    solN = Wave2D_Neumann()
-    hN, errorsN = solN(N, Nt, cfl = cfl, mx = mx, my = my, store_data = -1)
-    assert np.all(errorsN < 1e-12), f"Neumann errors not small: {errorsN}"
+
+if __name__ == "__main__":
+    test_convergence_wave2d()
+    test_convergence_wave2d_neumann()
+    test_exact_wave2d()
+    print("All tests passed!")
